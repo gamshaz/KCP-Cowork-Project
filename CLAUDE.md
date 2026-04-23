@@ -68,6 +68,8 @@ Whites = front 4 quarterlies (H/M/U/Z).
 
 **Strike grids:** SOFR 6.25bp, Euribor 6.25bp, SONIA 5bp.
 
+**Monthlies and underlying quarterlies.** Each quarterly (H/M/U/Z) has 3 monthly option expiries that share its underlying future: Z cycle = V/X/Z, U cycle = N/Q/U, M cycle = J/K/M, H cycle = F/G/H. **The futures-price dialog always asks for the underlying quarterly's price, never the monthly's** — there is no separate ERQ6 future; ERQ6 options settle into ERU6 futures. See `products.py::underlying_quarterly`.
+
 **Out of v1 scope:** USTs, EGBs, Gilts, OTC.
 
 ## Structure families in v1
@@ -82,6 +84,18 @@ Outrights, vertical spreads, flies (symmetric + broken in-favour + broken agains
 - **No sycophancy.** If the user is wrong or a suggestion would regress an earlier decision, say so.
 - **Small commits, working code at each step.**
 - **Portable context in the repo.** All load-bearing project context lives in `CLAUDE.md` and `docs/` so a session can be resumed from any machine with a clone.
+
+## Prototype-phase behaviours (replace when blpapi is wired)
+
+- **Always ask for the current futures price.** `scenario_needs_current_price()` returns True unless the user explicitly supplied an `anchor_price` number. `current_rates.json` holds the cash rate, not the futures price, and the two diverge whenever the curve prices in an expected move. The futures price is what decides call-vs-put direction in `_is_bullish`/`_is_bearish`.
+- **Dialog asks for the underlying quarterly.** For any monthly expiry (V/X, N/Q, J/K, F/G), the dialog resolves to its quarterly via `products.underlying_quarterly()` and asks for that. "What is the current ERU6 futures price?" even when the option is Q6.
+- **Replace both behaviours** when the blpapi feed is live — the tool will pull the futures price itself and the dialog goes away.
+
+## Parser contract
+
+- The LLM must return a **raw JSON object**, first character `{` and last character `}`. No markdown fences, no prose. Prompt enforces this explicitly.
+- The parser strips a leading ` ```json ... ``` ` fence defensively before JSON-decoding, for the times the model ignores the instruction.
+- Subprocess timeout is 120s (first `claude -p` call after login can be slow).
 
 ## Key files
 
