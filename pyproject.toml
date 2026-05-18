@@ -11,6 +11,9 @@ requires-python = ">=3.11"
 authors = [{ name = "KCP Rates Desk" }]
 dependencies = [
   "pyperclip>=1.8.2",
+  "pandas>=2.0",
+  "openpyxl>=3.1",
+  "xlrd>=2.0",
 ]
 
 [project.optional-dependencies]
