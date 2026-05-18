@@ -31,12 +31,42 @@ Rationale: aggressively lower cost than daily analysis; noise washes out across 
 
 ## 4. Product scope
 
-v2 covers:
+v2 covers **SR3 + 0Q**, focused on the quarterly futures and all the option chains that settle into them.
 
-- **SR3 quarterlies**: H6, M6, U6, Z6, H7, M7, U7, Z7 (CME `OPTION TYPE: American Options`)
-- **0Q (1-year mid-curve)**: same 2026-27 quarterlies (CME `OPTION TYPE: 1 Year Mid-Curve Options`)
+### 4.1 Futures (underlying)
 
-Everything else is filtered out by the loader.
+CME lists futures for many months, but only the **quarterlies** carry meaningful liquidity and desk positioning — those are the only futures we track:
+
+- 2026: H6 (Mar), M6 (Jun), U6 (Sep), Z6 (Dec)
+- 2027: H7, M7, U7, Z7
+
+Non-quarterly futures (FEB, APR, MAY, JUL, AUG, OCT, NOV) are present in the CME file but ignored by the loader.
+
+### 4.2 Option chains loaded
+
+For each quarterly we care about, we load **all three option expiries that settle into it** — the two intervening monthlies and the quarterly itself:
+
+| Quarterly cycle | Monthlies + quarterly (chronological) |
+|---|---|
+| H6 (Mar 2026) | F6, G6, H6 |
+| M6 (Jun 2026) | J6, K6, M6 |
+| U6 (Sep 2026) | N6, Q6, U6 |
+| Z6 (Dec 2026) | V6, X6, Z6 |
+| H7, M7, U7, Z7 | same pattern, 2027 |
+
+Total: **24 option chains per product × 2 products (SR3 + 0Q) = 48 chains**.
+
+CME files all of these under two `OPTION TYPE:` headings: `American Options` (SR3 whites = the quarterlies + their monthlies) and `1 Year Mid-Curve Options` (0Q, same structure). The loader loads every expiry sub-block found under those two headings.
+
+Everything else is filtered out: weeklies, 2Y-5Y mid-curves, First/Second-quarter monthly variants (different products, also out of scope).
+
+### 4.3 Aggregation behaviour: keep monthlies separate
+
+Monthly option chains are **always kept separate in the structured digest** — each monthly expiry has its own `per_expiry` block in §10. This preserves precision: V6 (front-month, fast theta) and Z6 (back-quarterly, real positioning) are different beasts even though they share the Z6 future.
+
+**The LLM is free to roll up to the parent cycle when describing themes** — "paper building Z6 upside" is fine narrative even if the actual data lives in V6 + X6 + Z6 separately. Roll-up is a narrative choice, not a data transformation. The system prompt explicitly permits it (§12).
+
+Underlying quarterly is resolved via `products.underlying_quarterly()` from Layer 1.
 
 ## 5. Data sources
 
@@ -44,11 +74,15 @@ Everything else is filtered out by the loader.
 
 - Source: CME website, public Volume & Open Interest report for Interest Rate Options.
 - Format: legacy binary `.xls` (OLE), single sheet `VOI Details Report`, ~2300 rows.
-- Shape: `Futures` section followed by ~29 `OPTION TYPE:` sections, each with per-expiry `MMM YY Calls` / `MMM YY Puts` sub-blocks of per-strike rows.
-- Key columns per strike row: `Strike | Globex | Open OutCry | Clear Port | Total Volume | Block Trades | EOO | Exercises | At Close | Change`. We care about **Total Volume** (today's volume), **At Close** (end-of-day OI), **Change** (ΔOI vs prior day — already computed by CME, saves us a diff).
+- Shape: top **`Futures` section** (one row per future month) followed by ~29 `OPTION TYPE:` sections, each with per-expiry `MMM YY Calls` / `MMM YY Puts` sub-blocks of per-strike rows.
+
+**From the futures section** (top of file), we capture **futures settle price and daily change per quarterly future** (H/M/U/Z only — non-quarterlies ignored per §4.1). Columns: `Month | Globex | Open OutCry | Clear Port | Total Volume | Block Trades | EFP | EFR | TAS | Deliveries | At Close | Change`. We use **At Close** (futures settle) and **Change** (daily move in price terms; positive = rates lower).
+
+**From the option-type sections**, per strike row, we capture: `Strike | Globex | Open OutCry | Clear Port | Total Volume | Block Trades | EOO | Exercises | At Close | Change`. We care about **Total Volume** (today's volume), **At Close** (end-of-day OI), **Change** (ΔOI vs prior day — already computed by CME, saves us a diff).
+
 - Strike format: 4-digit implied-decimal integer (`9631` = 96.31).
 - Trading date: not in the file; taken from the filename (`YYYY-MM-DD.xls`).
-- Storage: raw file `data/oi/daily/YYYY-MM-DD.xls`, parsed digest `data/oi/daily/YYYY-MM-DD.json`.
+- Storage: raw file `data/oi/daily/YYYY-MM-DD.xls`, parsed digest `data/oi/daily/YYYY-MM-DD.json`. Digest contains both the per-strike option rows AND the per-quarterly futures settles.
 
 ### 5.2 Flow Excel — street intel
 
@@ -183,6 +217,22 @@ A week with no tier-1 events is a single flat segment `week_flat`.
 
 A week with two tier-1 events close together (e.g. FOMC Wed + NFP Fri) has overlapping or adjacent segments; pre-aggregator handles this by reusing the same EOD snapshots across segments rather than trying to disambiguate.
 
+### 9.1 Worked example: CPI Wednesday
+
+Week of 17–21 Nov 2026, CPI prints Wed 18 Nov 8:30 ET (tier-1):
+
+| Segment | Trading days included | What it captures |
+|---|---|---|
+| `pre_CPI` | Mon 17 + Tue 18 EOD | Positioning *into* the event |
+| `event_day_CPI` | Wed 18 EOD | Reaction at the close (data prints 8:30 ET, futures move all day, this snapshot is the end-of-day result) |
+| `post_CPI` | Thu 19 + Fri 20 EOD | Follow-through or fade |
+
+The aggregator computes per-strike ΔOI, top volume, and futures move for *each segment independently*. The LLM then sees the three segments side-by-side and can tell the rotation story:
+
+> "Paper went into CPI long Z6 dovish calls (pre_CPI: Z6 96.75c +8.4k). Hot print on Wed (3.2 vs 3.0). They covered into the close (event_day_CPI: Z6 96.75c -7.1k) and rotated to puts (event_day_CPI: Z6 96.50p +6.2k). Build continued through Friday (post_CPI: Z6 96.50p +4.8k)."
+
+**Two events close together**: e.g. CPI Wed + NFP Fri in the same week. Both segment around their own event; Thu's EOD snapshot is both `post_CPI` *and* `pre_NFP`. The aggregator emits it twice, once for each segment context. Same EOD numbers, different framing.
+
 ## 10. Pre-aggregator output — the structured digest
 
 This is what the LLM actually sees. Shape:
@@ -259,8 +309,16 @@ Per (expiry, call_or_put):
 - **`top_oi_changes`**: top 5 strikes by `|ΔOI|` over the segment's trading days. Signed; a negative delta means OI was unwound.
 - **`top_volume`**: top 5 strikes by total volume over the segment's days.
 - **`oi_concentration`**: share of OI held by the top-5 strikes vs all strikes, as a concentration proxy.
-- **`futures_settle`**: end-of-segment futures settle price.
-- **`futures_move_bp`**: price change across the segment, in bp (positive = rates lower).
+
+Per expiry, the **futures settles** are pulled from the CME file's top `Futures` section (§5.1) for the **underlying quarterly** of that expiry. A V6 option expiry's `futures_settle` is the Z6 future's settle (resolved via `products.underlying_quarterly()`), since V6 options settle into Z6 futures.
+
+- **`futures_settle`**: closing settle of the underlying quarterly future at the end of the segment.
+- **`futures_move_bp`**: price change of that future across the segment, in bp (positive = rates lower).
+
+**Why we capture futures settles:**
+
+1. **Strike-level context.** A `+8.4k ΔOI` on a 96.75 call means different things if the future is at 96.39 (paper positioning above-screen for further rally) vs at 96.85 (paper rolling existing ATM positions). The settle frames every strike-level observation.
+2. **Event reaction validation.** The events API tells us CPI printed hot. The futures move tells us if the market actually reacted. CPI hot + future barely moved = market shrugged; CPI hot + future -15bp = real reaction. The LLM uses this to write honest narratives.
 
 Cross-expiry and cross-stream:
 
