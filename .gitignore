@@ -15,3 +15,9 @@ build/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local secrets / config — never commit
+config/settings.json
+
+# Layer 2 desk-local data — never commit
+data/
